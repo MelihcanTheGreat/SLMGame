@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+faster-whisper
+llama-cpp-python
+huggingface-hub
+pydantic
+numpy
