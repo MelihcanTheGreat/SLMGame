@@ -1,10 +1,22 @@
 import os
+import sys
 import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import tempfile
 
+# --- Windows GPU DLL Düzeltmesi ---
+if os.name == 'nt':
+    try:
+        import nvidia.cuda_runtime.lib
+        import nvidia.cublas.lib
+        import nvidia.cudnn.lib
+        os.add_dll_directory(os.path.dirname(nvidia.cuda_runtime.lib.__file__))
+        os.add_dll_directory(os.path.dirname(nvidia.cublas.lib.__file__))
+        os.add_dll_directory(os.path.dirname(nvidia.cudnn.lib.__file__))
+    except ImportError:
+        pass
 
 from faster_whisper import WhisperModel
 from llama_cpp import Llama
@@ -70,13 +82,15 @@ async def lifespan(app: FastAPI):
         print(f"Uyarı: guide.md okunamadı: {e}")
         guide_content = "Kılavuz bulunamadı."
         
-    # 2. Faster-Whisper'ı yükle (CUDA dll'leri eksik olduğu için CPU moduna zorluyoruz)
+    # 2. Faster-Whisper'ı yükle (Önce CUDA deniyoruz, olmazsa CPU)
     try:
-        print("Faster-Whisper 'cpu' (int8) ile başlatılıyor...")
-        whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-        device = "cpu"
+        print("Faster-Whisper 'cuda' (float16) ile başlatılmaya çalışılıyor...")
+        whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
+        device = "cuda"
     except Exception as e:
-        print(f"Whisper yükleme hatası: {e}")
+        print(f"GPU (CUDA) ile Whisper yükleme hatası: {e}")
+        print("Faster-Whisper 'cpu' (int8) moduna düşürülüyor...")
+        whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
         device = "cpu"
         
     # 3. Llama.cpp (Llama-3.2-1B) yükle
@@ -168,7 +182,7 @@ KURALLAR:
                 "schema": json_schema
             },
             temperature=0.1,
-            max_tokens=512
+            max_tokens=1024
         )
         
         llm_output = response["choices"][0]["message"]["content"]
