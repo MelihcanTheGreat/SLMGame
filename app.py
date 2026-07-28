@@ -4,7 +4,7 @@ import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-import tempfile
+import io
 
 # --- Windows GPU DLL Düzeltmesi ---
 if os.name == 'nt':
@@ -135,41 +135,37 @@ async def process_voice(
             "error_message": "Sadece .wav formatında ses dosyaları kabul edilmektedir."
         })
         
-    temp_file_path = ""
     try:
-        # Sesi geçici dosyaya kaydet
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            content = await audio.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
+        # Sesi doğrudan RAM'den (in-memory) işle
+        content = await audio.read()
+        audio_stream = io.BytesIO(content)
             
-        # 1. STT: Ses -> Metin
-        segments, info = whisper_model.transcribe(temp_file_path, language="tr", beam_size=5)
+        # 1. STT: Ses -> Metin (beam_size=1 ile hızlandırıldı)
+        segments, info = whisper_model.transcribe(audio_stream, language="tr", beam_size=1)
         transcription = " ".join([segment.text for segment in segments]).strip()
         
         if not transcription:
             raise ValueError("Ses dosyasından metin anlaşılamadı veya boş.")
             
         # 2. SLM: Metin -> JSON Komut
-        system_prompt = f"""Sen bir oyun içi yapay zeka asistanısın. Görevin oyuncunun verdiği sesli komutu analiz edip JSON formatında çıktı üretmektir.
-
-Oyunun şu anki durumu (game_context) sana 'user' mesajında verilecektir. Oradaki 'visible_npcs' listesini kullanarak isimleri ID'lere dönüştür.
+        system_prompt = f"""Sen bir JSON üreten yapay zeka asistanısın. Görevin oyuncunun verdiği tek cümleyi analiz edip kısa bir JSON çıktısı vermektir. Başka HİÇBİR ŞEY YAZMA.
 
 KURALLAR:
-1. Eğer komutta bir isim geçiyorsa, visible_npcs içinden o ismin ID'sini bul ve "target_npc_id" yap.
-2. İsim geçmiyorsa ve "pointed_npc_id" null değilse, komutu "pointed_npc_id" değerine ata. Hedef herkes ise "target_npc_id" değerini "all" yap.
-3. Birden fazla hedefe farklı komutlar verilmişse "commands" listesine birden fazla obje ekle.
-4. Hedef nesne veya kişi ismi YOKSA "target_object" kesinlikle "null" olmalıdır.
-5. Bir X, Y veya Z koordinatı belirtilmişse "is_specified" true olmalı, bahsedilmeyenler 0 olmalıdır.
-6. Koordinat veya sayı yoksa x,y,z 0 kalmalı, "is_specified" false olmalıdır.
-7. "action_type" kılavuza uygun olmalıdır.
-8. Her karakter için "npc_reply" alanına karakterin ağzından kısa ve eğlenceli bir cevap yaz (Örn: "Emredersin patron!", "Hemen odun kesmeye gidiyorum"). Cevap Türkçe olmalıdır.
+1. 'visible_npcs' listesini kullanarak isimleri ID'lere dönüştür. İsim yoksa 'pointed_npc_id' değerini kullan.
+2. Koordinat verilmemişse x,y,z HER ZAMAN 0 olmalı ve is_specified false olmalıdır.
+3. SADECE oyuncunun istediği eylemleri listeye ekle. Asla fazladan eylem uydurma.
+4. "npc_reply" için 1-2 kelimelik kısa bir onay mesajı yaz (Örn: "Emredersin!").
 
 --- OYUN KILAVUZU ---
 {guide_content}
 """
 
-        user_prompt = f"Oyun Bağlamı (game_context):\n{game_context}\n\nOyuncunun komutu: '{transcription}'"
+        user_prompt = f"""Oyun Bağlamı:
+{game_context}
+
+Oyuncunun komutu: '{transcription}'
+
+SADECE gecerli bir JSON dondur."""
         
         # LLM'den yanıt al
         response = llm_model.create_chat_completion(
@@ -202,11 +198,6 @@ KURALLAR:
             "status": "error",
             "error_message": str(e)
         })
-        
-    finally:
-        # Geçici dosyayı sil
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
 
 if __name__ == "__main__":
     import uvicorn
