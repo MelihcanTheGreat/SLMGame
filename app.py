@@ -101,12 +101,12 @@ async def lifespan(app: FastAPI):
             filename="Llama-3.2-1B-Instruct-Q4_K_M.gguf"
         )
         print(f"LLM modeli bulundu: {model_path}")
-        # n_ctx bağlam penceresi, n_gpu_layers GPU'ya yüklenecek katman sayısı (0=sadece CPU, -1=tamamı GPU)
-        n_gpu_layers = -1 if device == "cuda" else 0
+        # n_gpu_layers=-1 ile modelin tamamı (mümkünse) GPU'ya yüklenir. 
+        # CUDA veya Vulkan desteği yoksa kütüphane otomatik olarak işlemcide (CPU) çalıştırır.
         llm_model = Llama(
             model_path=model_path,
             n_ctx=2048,
-            n_gpu_layers=n_gpu_layers,
+            n_gpu_layers=-1,
             verbose=False
         )
     except Exception as e:
