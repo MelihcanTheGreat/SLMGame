@@ -18,9 +18,11 @@ GAME_CONTEXT = json.dumps({
     ]
 })
 
-SAMPLE_RATE = 16000 # Whisper için ideal oran 16000'dir
-SILENCE_THRESHOLD = 0.03 # Ses seviyesi (mikrofona göre ayarlanabilir)
-SILENCE_DURATION = 0.7   # Konuşma sonrası beklenecek sessizlik süresi (saniye)
+SAMPLE_RATE = 16000  # Whisper için ideal oran 16000'dir
+SILENCE_THRESHOLD = 0.01  # RMS tabanlı eşik (ortam gürültüsünün biraz üstü)
+SILENCE_DURATION = 1.0    # Konuşma sonrası beklenecek sessizlik süresi (saniye)
+WARMUP_DURATION = 0.3     # Mikrofon ısınma süresi (başlangıç spike'ını yok sayar)
+MIN_SPEECH_DURATION = 0.5 # Minimum konuşma süresi (saniye)
 
 def record_until_silence():
     print("\n🎤 Lütfen konuşun... (Konuşmanız bitince otomatik algılanacak)")
@@ -29,28 +31,46 @@ def record_until_silence():
     
     audio_buffer = []
     silent_chunks = 0
-    chunk_size = int(SAMPLE_RATE * 0.1) # 100ms
-    max_silence_chunks = int(SILENCE_DURATION / 0.1)
+    speech_chunks = 0
+    chunk_duration = 0.1  # 100ms
+    chunk_size = int(SAMPLE_RATE * chunk_duration)
+    max_silence_chunks = int(SILENCE_DURATION / chunk_duration)
+    warmup_chunks = int(WARMUP_DURATION / chunk_duration)
+    min_speech_chunks = int(MIN_SPEECH_DURATION / chunk_duration)
     has_spoken = False
+    chunk_count = 0
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32') as stream:
         while True:
             audio_chunk, overflowed = stream.read(chunk_size)
-            volume = np.max(np.abs(audio_chunk))
+            chunk_count += 1
             
-            if volume > SILENCE_THRESHOLD:
+            # RMS (Root Mean Square) ile ses seviyesi hesapla - daha güvenilir
+            rms = np.sqrt(np.mean(audio_chunk**2))
+            
+            # Mikrofon ısınma süresi - ilk chunk'lardaki spike'ı yok say
+            if chunk_count <= warmup_chunks:
+                continue
+            
+            # Canlı ses seviyesi göstergesi
+            bar = "█" * min(int(rms * 500), 50)
+            status = "🔴 Konuşma" if rms > SILENCE_THRESHOLD else "⚪ Sessiz"
+            print(f"\r{status} | {bar:<50} | RMS: {rms:.4f}", end="", flush=True)
+            
+            if rms > SILENCE_THRESHOLD:
                 has_spoken = True
+                speech_chunks += 1
                 silent_chunks = 0
             else:
                 if has_spoken:
                     silent_chunks += 1
             
-            # Başta çok az sessizlik kaydedelim, konuşma başlayınca asıl kayda alalım
-            if has_spoken:
-                audio_buffer.append(audio_chunk)
+            # Her zaman kaydet (konuşma öncesi biraz bağlam için)
+            audio_buffer.append(audio_chunk)
                 
-            if has_spoken and silent_chunks >= max_silence_chunks:
-                print("✅ Konuşma bittiği algılandı, API'ye gönderiliyor...")
+            # Yeterince konuşulmuş ve sessizlik süresine ulaşılmış mı?
+            if has_spoken and speech_chunks >= min_speech_chunks and silent_chunks >= max_silence_chunks:
+                print(f"\n✅ Konuşma bittiği algılandı ({speech_chunks * chunk_duration:.1f}s konuşma), API'ye gönderiliyor...")
                 break
                 
     return np.concatenate(audio_buffer, axis=0)

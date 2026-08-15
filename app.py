@@ -1,6 +1,9 @@
 import os
 import sys
 import json
+import time
+import asyncio
+from typing import Annotated
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -10,8 +13,8 @@ import io
 if os.name == 'nt':
     try:
         import nvidia.cuda_runtime.lib
-        import nvidia.cublas.lib
-        import nvidia.cudnn.lib
+        import nvidia.cublas.lib  # type: ignore
+        import nvidia.cudnn.lib  # type: ignore
         os.add_dll_directory(os.path.dirname(nvidia.cuda_runtime.lib.__file__))
         os.add_dll_directory(os.path.dirname(nvidia.cublas.lib.__file__))
         os.add_dll_directory(os.path.dirname(nvidia.cudnn.lib.__file__))
@@ -76,22 +79,23 @@ async def lifespan(app: FastAPI):
     # 1. Kılavuz dosyasını oku
     guide_path = os.path.join(os.path.dirname(__file__), "guide.md")
     try:
-        with open(guide_path, "r", encoding="utf-8") as f:
-            guide_content = f.read()
+        def read_guide():
+            with open(guide_path, "r", encoding="utf-8") as f:
+                return f.read()
+        guide_content = await asyncio.to_thread(read_guide)
     except Exception as e:
         print(f"Uyarı: guide.md okunamadı: {e}")
         guide_content = "Kılavuz bulunamadı."
         
     # 2. Faster-Whisper'ı yükle (Önce CUDA deniyoruz, olmazsa CPU)
+    # "base" model, "small"a göre ~3x daha hızlı, kısa komutlar için yeterli doğruluk
     try:
-        print("Faster-Whisper 'cuda' (float16) ile başlatılmaya çalışılıyor...")
-        whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
-        device = "cuda"
+        print("Faster-Whisper 'base' modeli 'cuda' (float16) ile başlatılıyor...")
+        whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
     except Exception as e:
         print(f"GPU (CUDA) ile Whisper yükleme hatası: {e}")
-        print("Faster-Whisper 'cpu' (int8) moduna düşürülüyor...")
-        whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-        device = "cpu"
+        print("Faster-Whisper 'base' modeli 'cpu' (int8) moduna düşürülüyor...")
+        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
         
     # 3. Llama.cpp (Llama-3.2-1B) yükle
     print("Llama-3.2-1B-Instruct-GGUF modeli kontrol ediliyor/indiriliyor...")
@@ -105,7 +109,7 @@ async def lifespan(app: FastAPI):
         # CUDA veya Vulkan desteği yoksa kütüphane otomatik olarak işlemcide (CPU) çalıştırır.
         llm_model = Llama(
             model_path=model_path,
-            n_ctx=2048,
+            n_ctx=1024,  # Kısa komutlar için 1024 yeterli (2048'den düşürüldü)
             n_gpu_layers=-1,
             verbose=False
         )
@@ -120,8 +124,8 @@ app = FastAPI(lifespan=lifespan, title="Oyun Ses Kontrol API")
 
 @app.post("/api/v1/process-voice")
 async def process_voice(
-    audio: UploadFile = File(...),
-    game_context: str = Form(...)
+    audio: Annotated[UploadFile, File(...)],
+    game_context: Annotated[str, Form(...)]
 ):
     if whisper_model is None or llm_model is None:
         return JSONResponse(status_code=503, content={
@@ -140,58 +144,84 @@ async def process_voice(
         content = await audio.read()
         audio_stream = io.BytesIO(content)
             
-        # 1. STT: Ses -> Metin (beam_size=1 ile hızlandırıldı)
-        segments, info = whisper_model.transcribe(audio_stream, language="tr", beam_size=1)
+        # 1. STT: Ses -> Metin (beam_size=1 + vad_filter ile hızlandırıldı)
+        t0 = time.perf_counter()
+        segments, info = whisper_model.transcribe(
+            audio_stream,
+            language="tr",
+            beam_size=1,
+            vad_filter=True,          # Sessiz bölümleri atla
+            vad_parameters={
+                "min_silence_duration_ms": 300  # 300ms sessizlik = konuşma sonu
+            }
+        )
         transcription = " ".join([segment.text for segment in segments]).strip()
+        t1 = time.perf_counter()
+        stt_time = t1 - t0
         
         if not transcription:
             raise ValueError("Ses dosyasından metin anlaşılamadı veya boş.")
             
-        # 2. SLM: Metin -> JSON Komut
-        system_prompt = f"""Sen bir JSON üreten yapay zeka asistanısın. Görevin oyuncunun verdiği tek cümleyi analiz edip kısa bir JSON çıktısı vermektir. Başka HİÇBİR ŞEY YAZMA.
+        # Ornek JSON ekleyerek 1B modelin dogru format uretmesi saglaniyor
+        system_prompt = """Return ONLY valid JSON. Format:
+{
+  "commands": [
+    {
+      "target_npc_id": 1,
+      "action_type": "move",
+      "target_object": null,
+      "target_location": {"x": 0, "y": 0, "z": 0, "is_specified": false},
+      "npc_reply": "OK"
+    }
+  ]
+}
+Actions: move,gather,attack,defend,idle,talk. Match NPC names to IDs from visible_npcs. If no name, use pointed_npc_id. If no coordinates, set x,y,z=0 and is_specified=false."""
 
-KURALLAR:
-1. 'visible_npcs' listesini kullanarak isimleri ID'lere dönüştür. İsim yoksa 'pointed_npc_id' değerini kullan.
-2. Koordinat verilmemişse x,y,z HER ZAMAN 0 olmalı ve is_specified false olmalıdır.
-3. SADECE oyuncunun istediği eylemleri listeye ekle. Asla fazladan eylem uydurma.
-4. "npc_reply" için 1-2 kelimelik kısa bir onay mesajı yaz (Örn: "Emredersin!").
-
---- OYUN KILAVUZU ---
-{guide_content}
-"""
-
-        user_prompt = f"""Oyun Bağlamı:
-{game_context}
-
-Oyuncunun komutu: '{transcription}'
-
-SADECE gecerli bir JSON dondur."""
+        user_prompt = f"Context: {game_context}\nCommand: '{transcription}'\nJSON:"
         
         # LLM'den yanıt al
+        t2 = time.perf_counter()
+        
         response = llm_model.create_chat_completion(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format={
-                "type": "json_object",
-                "schema": json_schema
-            },
             temperature=0.1,
-            max_tokens=1024
+            max_tokens=192,
+            response_format={"type": "json_object"}
         )
-        
         llm_output = response["choices"][0]["message"]["content"]
-        command_data = json.loads(llm_output)
+        
+        # JSON'i ciktidan ayikla (model bazen ekstra metin ekleyebilir)
+        # raw_decode sadece ilk JSON objesini parse eder, gerisini yok sayar
+        start_idx = llm_output.find("{")
+        if start_idx != -1:
+            try:
+                decoder = json.JSONDecoder()
+                command_data, _ = decoder.raw_decode(llm_output, start_idx)
+            except json.JSONDecodeError as jde:
+                print(f"JSON Parse Hatası. LLM Çıktısı:\n{llm_output}")
+                raise ValueError(f"Geçersiz JSON formatı: {jde}\nLLM Çıktısı: {llm_output}")
+        else:
+            raise ValueError(f"JSON bulunamadi: {llm_output[:200]}")
+        
+        t3 = time.perf_counter()
+        llm_time = t3 - t2
+        
+        print(f"[TIMING] STT: {stt_time:.2f}s | LLM: {llm_time:.2f}s | Toplam: {stt_time+llm_time:.2f}s")
         
         return {
             "transcription": transcription,
             "commands": command_data.get("commands", []),
             "status": "success",
-            "error_message": None
+            "error_message": None,
+            "timing": {"stt_seconds": round(stt_time, 2), "llm_seconds": round(llm_time, 2)}
         }
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={
             "transcription": locals().get("transcription", ""),
             "command": None,
