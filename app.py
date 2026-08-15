@@ -163,19 +163,27 @@ async def process_voice(
             raise ValueError("Ses dosyasından metin anlaşılamadı veya boş.")
             
         # Ornek JSON ekleyerek 1B modelin dogru format uretmesi saglaniyor
-        system_prompt = """Return ONLY valid JSON. Format:
-{
-  "commands": [
-    {
-      "target_npc_id": 1,
-      "action_type": "move",
-      "target_object": null,
-      "target_location": {"x": 0, "y": 0, "z": 0, "is_specified": false},
-      "npc_reply": "OK"
-    }
-  ]
-}
-Actions: move,gather,attack,defend,idle,talk. Match NPC names to IDs from visible_npcs. If no name, use pointed_npc_id. If no coordinates, set x,y,z=0 and is_specified=false."""
+        system_prompt = """Return ONLY valid JSON.
+Map NPC names/numbers in the command to the ID from visible_npcs. 
+If NO NPC is mentioned, use pointed_npc_id.
+Actions: move, gather, attack, defend, idle, talk.
+
+EXAMPLES:
+Context: {"pointed_npc_id": 5, "visible_npcs": [{"id": 1, "name": "Veli"}, {"id": 3, "name": "Okçu"}]}
+Command: 'Veli odun topla'
+JSON:
+{"commands":[{"target_npc_id":1,"action_type":"gather","target_object":"wood","target_location":{"x":0,"y":0,"z":0,"is_specified":false},"npc_reply":"Tamam"}]}
+
+Context: {"pointed_npc_id": 5, "visible_npcs": [{"id": 1, "name": "Veli"}, {"id": 3, "name": "Okçu"}]}
+Command: '3 numara saldır'
+JSON:
+{"commands":[{"target_npc_id":3,"action_type":"attack","target_object":null,"target_location":{"x":0,"y":0,"z":0,"is_specified":false},"npc_reply":"Saldırıyorum"}]}
+
+Context: {"pointed_npc_id": 5, "visible_npcs": [{"id": 1, "name": "Veli"}, {"id": 3, "name": "Okçu"}]}
+Command: 'Buraya gel'
+JSON:
+{"commands":[{"target_npc_id":5,"action_type":"move","target_object":null,"target_location":{"x":0,"y":0,"z":0,"is_specified":false},"npc_reply":"Geliyorum"}]}
+"""
 
         user_prompt = f"Context: {game_context}\nCommand: '{transcription}'\nJSON:"
         
